@@ -180,10 +180,9 @@ async fn test_redirect_removes_sensitive_headers() {
 
             rx.changed().await.unwrap();
             let mid_addr = rx.borrow().unwrap();
-            assert_eq!(
-                req.headers()["referer"],
-                format!("http://{mid_addr}/sensitive")
-            );
+            // another origin gets the origin of the previous URL, not its
+            // path and query
+            assert_eq!(req.headers()["referer"], format!("http://{mid_addr}/"));
             http::Response::default()
         }
     });
@@ -209,6 +208,89 @@ async fn test_redirect_removes_sensitive_headers() {
             reqwest::header::COOKIE,
             reqwest::header::HeaderValue::from_static("foo=bar"),
         )
+        .send()
+        .await
+        .unwrap();
+}
+
+// a.com -> b.com/step1 -> b.com/step2: the credentials left at the first hop
+// must not come back on the second one, although step1 and step2 share a host.
+#[tokio::test]
+async fn test_redirect_keeps_sensitive_headers_off_for_the_rest_of_the_chain() {
+    let end_server = server::http(move |req| async move {
+        match req.uri().path() {
+            "/step1" => {
+                assert_eq!(req.headers().get("cookie"), None);
+                assert_eq!(req.headers().get("authorization"), None);
+                http::Response::builder()
+                    .status(302)
+                    .header("location", "/step2")
+                    .body(Body::default())
+                    .unwrap()
+            }
+            "/step2" => {
+                assert_eq!(req.headers().get("cookie"), None);
+                assert_eq!(req.headers().get("authorization"), None);
+                http::Response::default()
+            }
+            other => panic!("unexpected path {other}"),
+        }
+    });
+    let end_addr = end_server.addr();
+
+    let mid_server = server::http(move |req| async move {
+        assert_eq!(req.headers()["cookie"], "foo=bar");
+        assert_eq!(req.headers()["authorization"], "Bearer secret");
+        http::Response::builder()
+            .status(302)
+            .header("location", format!("http://{end_addr}/step1"))
+            .body(Body::default())
+            .unwrap()
+    });
+
+    let res = reqwest::Client::new()
+        .get(&format!("http://{}/start", mid_server.addr()))
+        .header(reqwest::header::COOKIE, "foo=bar")
+        .header(reqwest::header::AUTHORIZATION, "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.url().path(), "/step2");
+}
+
+// Within the origin the Referer keeps the full previous URL, query included.
+#[tokio::test]
+async fn test_redirect_referer_within_origin_keeps_path_and_query() {
+    use tokio::sync::watch;
+
+    let (tx, rx) = watch::channel::<Option<std::net::SocketAddr>>(None);
+
+    let server = server::http(move |req| {
+        let mut rx = rx.clone();
+        async move {
+            match req.uri().path() {
+                "/start" => http::Response::builder()
+                    .status(302)
+                    .header("location", "/end")
+                    .body(Body::default())
+                    .unwrap(),
+                "/end" => {
+                    rx.changed().await.unwrap();
+                    let addr = rx.borrow().unwrap();
+                    assert_eq!(
+                        req.headers()["referer"],
+                        format!("http://{addr}/start?api_key=secret")
+                    );
+                    http::Response::default()
+                }
+                other => panic!("unexpected path {other}"),
+            }
+        }
+    });
+    tx.send(Some(server.addr())).unwrap();
+
+    reqwest::Client::new()
+        .get(&format!("http://{}/start?api_key=secret", server.addr()))
         .send()
         .await
         .unwrap();

@@ -236,18 +236,27 @@ pub(crate) enum ActionKind {
     Error(Box<dyn StdError + Send + Sync>),
 }
 
+/// Removes the credential headers from a redirected request once the chain
+/// has left the origin of the original request.
+///
+/// `previous` holds every URL of the chain so far, the original first. Each
+/// redirected request is rebuilt from the original request's headers, so the
+/// check must look at the whole chain, not only at the last hop: a chain
+/// a.com -> b.com/1 -> b.com/2 has left a.com at the first hop and must not
+/// hand the credentials to b.com/2 just because b.com/1 and b.com/2 share a
+/// host. This is the behaviour Go adopted for CVE-2024-45336.
 pub(crate) fn remove_sensitive_headers(headers: &mut HeaderMap, next: &Url, previous: &[Url]) {
-    if let Some(previous) = previous.last() {
-        let cross_host = next.host_str() != previous.host_str()
-            || next.port_or_known_default() != previous.port_or_known_default()
-            || next.scheme() != previous.scheme();
-        if cross_host {
-            headers.remove(AUTHORIZATION);
-            headers.remove(COOKIE);
-            headers.remove("cookie2");
-            headers.remove(PROXY_AUTHORIZATION);
-            headers.remove(WWW_AUTHENTICATE);
-        }
+    let Some(origin) = previous.first() else {
+        return;
+    };
+    let left_origin = !same_origin(next, origin)
+        || previous[1..].iter().any(|hop| !same_origin(hop, origin));
+    if left_origin {
+        headers.remove(AUTHORIZATION);
+        headers.remove(COOKIE);
+        headers.remove("cookie2");
+        headers.remove(PROXY_AUTHORIZATION);
+        headers.remove(WWW_AUTHENTICATE);
     }
 }
 
@@ -291,6 +300,11 @@ impl TowerRedirectPolicy {
     }
 }
 
+/// Builds the `Referer` for the next hop from the previous one. Within the
+/// origin the full URL is sent, without credentials and fragment. To another
+/// origin only the origin itself is sent, as browsers do under
+/// `strict-origin-when-cross-origin`: the previous URL's path and query are
+/// that origin's business, and a query string may carry an API key.
 fn make_referer(next: &Url, previous: &Url) -> Option<HeaderValue> {
     if next.scheme() == "http" && previous.scheme() == "https" {
         return None;
@@ -300,7 +314,18 @@ fn make_referer(next: &Url, previous: &Url) -> Option<HeaderValue> {
     let _ = referer.set_username("");
     let _ = referer.set_password(None);
     referer.set_fragment(None);
+    if !same_origin(next, previous) {
+        referer.set_path("/");
+        referer.set_query(None);
+    }
     referer.as_str().parse().ok()
+}
+
+/// Two URLs share an origin when scheme, host and effective port are equal.
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 impl TowerPolicy<async_impl::body::Body, crate::Error> for TowerRedirectPolicy {
@@ -431,6 +456,60 @@ fn test_remove_sensitive_headers() {
 
     remove_sensitive_headers(&mut headers, &next, &prev);
     assert_eq!(headers, filtered_headers);
+}
+
+// A chain that left the origin must not get the credentials back on a later
+// hop that stays on the other host: each redirected request is rebuilt from
+// the original headers, so the check has to cover the whole chain.
+#[test]
+fn test_remove_sensitive_headers_for_the_rest_of_the_chain() {
+    use hyper::header::{HeaderValue, ACCEPT, AUTHORIZATION, COOKIE};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("let me in"));
+    headers.insert(COOKIE, HeaderValue::from_static("foo=bar"));
+    let mut expected = headers.clone();
+    expected.remove(AUTHORIZATION);
+    expected.remove(COOKIE);
+
+    // a.com -> b.com/1 -> b.com/2: the second hop is on the same host as
+    // the first one, but the chain left a.com already.
+    let prev = vec![
+        Url::parse("http://a.com/").unwrap(),
+        Url::parse("http://b.com/1").unwrap(),
+    ];
+    let next = Url::parse("http://b.com/2").unwrap();
+    remove_sensitive_headers(&mut headers, &next, &prev);
+    assert_eq!(headers, expected);
+
+    // a.com -> b.com -> a.com: coming back does not restore them either.
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("let me in"));
+    let next = Url::parse("http://a.com/back").unwrap();
+    remove_sensitive_headers(&mut headers, &next, &prev);
+    assert_eq!(headers.get(AUTHORIZATION), None);
+}
+
+#[test]
+fn test_make_referer_sends_only_the_origin_to_another_origin() {
+    let previous = Url::parse("http://a.com:8080/path/to?api_key=secret#frag").unwrap();
+
+    let same = Url::parse("http://a.com:8080/next").unwrap();
+    assert_eq!(
+        make_referer(&same, &previous).unwrap(),
+        "http://a.com:8080/path/to?api_key=secret"
+    );
+
+    let other = Url::parse("http://b.com/landed").unwrap();
+    assert_eq!(make_referer(&other, &previous).unwrap(), "http://a.com:8080/");
+
+    let other_port = Url::parse("http://a.com:9090/landed").unwrap();
+    assert_eq!(make_referer(&other_port, &previous).unwrap(), "http://a.com:8080/");
+
+    let downgrade = Url::parse("http://a.com/landed").unwrap();
+    let secure = Url::parse("https://a.com/path?api_key=secret").unwrap();
+    assert_eq!(make_referer(&downgrade, &secure), None);
 }
 
 #[test]
